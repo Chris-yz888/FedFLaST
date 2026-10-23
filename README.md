@@ -2,7 +2,7 @@
 
 Code release for **FedFLaST: Improving Generalization in Federated Dynamic Sparse Training via Flatness-Aware Topology Adaptation**.
 
-FedFLaST adds server-side global perturbation and client-side SAM-guided pruning to federated dynamic sparse training. The provided implementation uses the submitted paper's pruning score:
+FedFLaST adds server-side global perturbation and client-side SAM-guided pruning to federated dynamic sparse training. The implementation uses the following pruning score:
 
 ```text
 s0_i = |w_i * g0_i|
@@ -18,7 +18,7 @@ At a mask-adjustment round, the client computes `g0` on a minibatch, perturbs cu
 - `scripts/eval_robustness.py`: CIFAR-10-C checkpoint evaluator.
 - `requirements.txt`: Python dependencies.
 
-This code-only package contains no datasets, pretrained weights, logs, experiment records, paper drafts, or Git history.
+This repository contains source code only: no datasets, pretrained weights, logs, or experiment records are included.
 
 ## Environment
 
@@ -107,20 +107,13 @@ python scripts/eval_robustness.py \
 
 The evaluator reports accuracy and cross-entropy over the standard 15 corruptions and five severity levels. It does not compute normalized mCE.
 
-## Publish from your local computer
-
-Extract this ZIP and open a terminal in the extracted directory. After authenticating GitHub on your computer, run:
+## Clone
 
 ```bash
-git init -b main
-git add .
-git commit -m "Release FedFLaST source code"
-git remote add origin https://github.com/Chris-yz888/FedFLaST.git
-git push -u origin main
+git clone https://github.com/Chris-yz888/FedFLaST.git
+cd FedFLaST
 ```
-
-These commands assume an empty remote repository. If the remote already has commits, clone it first and copy the extracted files into that checkout before committing and pushing.
 
 ## License
 
-No license has been selected for this release yet. Add the chosen license before publishing the repository publicly.
+No license has been selected for this repository yet.
