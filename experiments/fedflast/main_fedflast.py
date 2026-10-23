@@ -1,0 +1,381 @@
+import argparse
+import logging
+import os
+import random
+import socket
+import sys
+
+import numpy as np
+import psutil
+import setproctitle
+import torch
+import wandb
+
+# add the FedML root directory to the python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "./../../../")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "./../../")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "")))
+
+from api.distributed.utils.gpu_mapping import mapping_processes_to_gpu_device_from_yaml_file
+
+from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
+from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifar100
+from api.data_preprocessing.cinic10.data_loader import load_partition_data_cinic10
+from api.data_preprocessing.svhn.data_loader import load_partition_data_svhn
+from api.data_preprocessing.tinystories.data_loader import load_partition_data_tinystories
+from api.data_preprocessing.tinyimagenet.data_loader import load_partition_data_tiny
+
+from api.model.cv.resnet_gn import resnet18 as resnet18_gn
+from api.model.cv.mobilenet import mobilenet
+from api.model.cv.resnet import resnet18, resnet56
+from api.model.nlp.gpt2 import GPT2Model, GPT2Config
+from torchvision.models import mobilenet_v3_small as MobileNetV3
+from torchvision.models import efficientnet_v2_s as EfficientNetV2
+from torchvision.models import squeezenet1_1 as SqueezeNet
+from torchvision.models import shufflenet_v2_x0_5 as ShuffleNet
+from torchvision.models import swin_t as SwinT
+from torchvision.models import vit_b_16 as ViT
+from torchvision.models import mnasnet0_75 as MNASNet
+
+
+from api.distributed.fedflast.FedFLaSTAPI import FedML_init, FedML_FedFLaST_distributed
+from api.pruning.model_pruning import SparseModel
+
+
+def add_args(parser):
+    """
+    parser : argparse.ArgumentParser
+    return a parser added with args required by fit
+    """
+    # Training settings
+    parser.add_argument("--model", type=str, default="resnet56", metavar="N", help="neural network used in training")
+
+    parser.add_argument("--dataset", type=str, default="cifar10", metavar="N", help="dataset used for training")
+
+    parser.add_argument(
+        "--dataset_ratio", type=float, default=0.05, metavar="PA", help="the ratio of subset for the total dataset (default: 0.05). Only appliable for [tinystories, ]"
+    )
+
+    parser.add_argument(
+        "--partition_alpha", type=float, default=0.5, metavar="PA", help="partition alpha (default: 0.5)"
+    )
+
+    parser.add_argument("--seed", type=int, default=0, help="random seed for partitioning and initialization")
+
+    parser.add_argument(
+        "--client_num_in_total", type=int, default=10, metavar="NN", help="number of workers in a distributed cluster"
+    )
+
+    parser.add_argument("--client_num_per_round", type=int, default=10, metavar="NN", help="number of workers")
+
+    parser.add_argument(
+        "--batch_size", type=int, default=64, metavar="N", help="input batch size for training (default: 64)"
+    )
+
+    parser.add_argument(
+        "--nlp_hidden_size", type=int, default=256, metavar="N", help="the hidden size for nlp model (default: 256) option: [64, 256, 1024]"
+    )
+
+    parser.add_argument(
+        "--num_eval", type=int, default=128, help="the number of the data samples used for eval, -1 is the total testing dataset."
+    )
+    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
+                        help='learning rate (default: 0.001)')
+
+    parser.add_argument("--epochs", type=int, default=5, metavar="EP", help="how many epochs will be trained locally")
+
+    parser.add_argument("--A_epochs", type=int, default=0, metavar="EP", help="how many epochs will be trained before pruning and growing ")
+
+    parser.add_argument("--comm_round", type=int, default=10, help="how many round of communications we shoud use")
+
+    parser.add_argument("--frequency_of_the_test", type=int, default=5, help="the frequency of the algorithms")
+
+    parser.add_argument('--pruning_strategy', type=str, default="ERK_magnitude",
+        help='the distribution of layerwise density and the pruning method, options["uniform_magnitude", "ER_magnitude", "ERK_magnitude"]')
+
+    parser.add_argument('--target_density', type=float, default=0.5,
+                        help='pruning target density')
+
+    parser.add_argument('--delta_T', type=int, default=10, help='delta t for update')
+
+    parser.add_argument('--T_end', type=int, default=100, help='end of time for update')
+
+    parser.add_argument("--adjust_alpha", type=float, default=0.2, help='the ratio of num elements for adjustments')
+
+    parser.add_argument("--adjustment_epochs", type=int, default=None, help=" the number of local apoches used in model adjustment round, if it is set None, it is equal to the number of epoches for training round" )
+
+    parser.add_argument("--save_final_checkpoint",
+                        type=lambda x: (str(x).lower() == "true"), default=False,
+                        help="save the final server model and sparse mask for analysis")
+    parser.add_argument("--checkpoint_path", type=str, default=None,
+                        help="output .pt path used when --save_final_checkpoint=true")
+
+    # FedFLaST Module 1: Mask-Projected Global Momentum Perturbation
+    parser.add_argument("--use_fedflast_perturbation", "--use_fedfrost_perturbation",
+                        dest="use_fedflast_perturbation",
+                        type=lambda x: (str(x).lower() == 'true'), default=False,
+                        help="whether to enable FedFLaST perturbation module")
+    parser.add_argument("--flast_rho", "--frost_rho", dest="flast_rho", type=float, default=0.05,
+                        help="perturbation radius rho for FedFLaST (default: 0.05)")
+    parser.add_argument("--flast_momentum", "--frost_momentum", dest="flast_momentum", type=float, default=0.9,
+                        help="momentum coefficient mu for FedFLaST (default: 0.9)")
+    parser.add_argument("--flast_eps", "--frost_eps", dest="flast_eps", type=float, default=1e-12,
+                        help="epsilon for numerical stability in FedFLaST (default: 1e-12)")
+    parser.add_argument("--flast_server_lr", "--frost_server_lr", dest="flast_server_lr", type=float, default=1.0,
+                        help="server learning rate eta_s for FedFLaST (default: 1.0)")
+    parser.add_argument("--use_flast_topology", "--use_frost_topology",
+                        dest="use_flast_topology",
+                        type=lambda x: (str(x).lower() == 'true'), default=False,
+                        help="whether to enable FedFLaST Module 2 topology-guided pruning")
+    parser.add_argument("--flast_topology_lambda", "--frost_topology_lambda",
+                        dest="flast_topology_lambda", type=float, default=0.0,
+                        help="lambda for topology guidance score in server mask pruning")
+    parser.add_argument("--flast_topology_score", "--frost_topology_score",
+                        dest="flast_topology_score", type=str, default="momentum",
+                        choices=["momentum", "pseudo_gradient", "w_pseudo_gradient", "momentum_plus_pg"],
+                        help="topology guidance signal used by FedFLaST Module 2")
+    parser.add_argument("--use_flast_client_sam_prune",
+                        dest="use_flast_client_sam_prune",
+                        type=lambda x: (str(x).lower() == 'true'), default=False,
+                        help="whether to enable FedFLaST Module 2 client-side SAM-guided pruning")
+    parser.add_argument("--flast_local_rho", type=float, default=0.05,
+                        help="local SAM probe radius for client-side pruning (default: 0.05)")
+    parser.add_argument("--flast_local_eps", type=float, default=1e-12,
+                        help="epsilon for local SAM probe numerical stability (default: 1e-12)")
+    parser.add_argument("--flast_candidate_multiplier", type=float, default=2.0,
+                        help="candidate pool size multiplier for SAM-guided prune, e.g. 2 means Bottom-2k magnitude candidates")
+    parser.add_argument("--flast_local_sam_norm", type=str, default="l2", choices=["l2", "sign"],
+                        help="local SAM perturbation normalization for client-side pruning: l2 is standard SAM; sign is element-wise")
+
+    # Following arguments are seldom changed
+    parser.add_argument(
+        "--gpu_mapping_key", type=str, default="mapping_default", help="the key in gpu utilization file"
+    )
+    parser.add_argument("--ci", type=int, default=0, help="CI")
+
+    parser.add_argument(
+            "--gpu_mapping_file",
+            type=str,
+            default="gpu_mapping.yaml",
+            help="the gpu utilization file for servers and clients. If there is no \
+                            gpu_util_file, gpu will not be used.",
+        )
+
+    parser.add_argument("--gpu_server_num", type=int, default=1, help="gpu_server_num")
+
+    parser.add_argument("--gpu_num_per_server", type=int, default=4, help="gpu_num_per_server")
+
+    parser.add_argument(
+        "--is_mobile", type=int, default=1, help="whether the program is running on the FedML-Mobile server side"
+    )
+
+    parser.add_argument("--backend", type=str, default="MPI", help="Backend for Server and Client")
+
+    parser.add_argument("--wd", help="weight decay parameter;", type=float, default=0.001)
+
+    parser.add_argument(
+        "--partition_method",
+        type=str,
+        default="hetero",
+        metavar="N",
+        help="how to partition the dataset on local workers",
+    )
+
+    parser.add_argument("--data_dir", type=str, default=None, help="data directory")
+
+    parser.add_argument("--client_optimizer", type=str, default="sgd", help="SGD with momentum; adam")
+
+    parser.add_argument("--growth_data_mode", type=str, default="batch", help=" the number of data samples used for parameter growth, option are [ 'random', 'single', 'batch', 'entire']" )
+
+    args = parser.parse_args()  
+    return args
+
+
+def load_data(args, dataset_name):
+
+    if args.data_dir is None:
+        if dataset_name == "tinyimagenet":
+            args.data_dir = f"./../../data/Tiny-ImageNet"
+        else:
+            args.data_dir = f"./../../data/{dataset_name}"
+    
+    if dataset_name == "tinystories":
+        dataset_tuple = load_partition_data_tinystories(args.partition_method, args.partition_alpha, args.client_num_in_total, args.batch_size,  args.dataset_ratio)
+    elif dataset_name == "tinyimagenet":
+        dataset_tuple = load_partition_data_tiny(
+            args.data_dir,
+            args.partition_method,
+            args.partition_alpha,
+            args.client_num_in_total,
+            args.batch_size,
+        )
+    else:
+        if dataset_name == "cifar10":
+            data_loader = load_partition_data_cifar10
+        elif dataset_name == "cifar100":
+            data_loader = load_partition_data_cifar100
+        elif dataset_name == "cinic10":
+            data_loader = load_partition_data_cinic10
+        elif dataset_name == "svhn":
+            data_loader = load_partition_data_svhn
+        else:
+            data_loader = load_partition_data_cifar10
+
+        dataset_tuple = data_loader(
+            args.dataset,
+            args.data_dir,
+            args.partition_method,
+            args.partition_alpha,
+            args.client_num_in_total,
+            args.batch_size,
+            )
+        
+    return dataset_tuple
+
+
+def create_model(args, model_name, output_dim):
+    logging.info("create_model. model_name = %s, output_dim = %s" % (model_name, output_dim))
+    model = None
+    if model_name == "resnet18_gn":
+        model = resnet18_gn(num_classes=output_dim)
+    if model_name == "resnet18":
+        model = resnet18(class_num=output_dim)
+    elif model_name == "resnet56":
+        model = resnet56(class_num=output_dim)
+    elif model_name == "mobilenet":
+        model = mobilenet(class_num = output_dim)
+    elif model_name == "mobilenetv3":
+        model = MobileNetV3(num_classes=output_dim)
+    elif model_name == "efficientnet":
+        model = EfficientNetV2(num_classes=output_dim)
+    elif model_name == "shufflenet":
+        model = ShuffleNet(num_classes=output_dim)
+    elif model_name == "squeezenet":
+        model = SqueezeNet(num_classes=output_dim)
+    elif model_name == "swint":
+        model = SwinT(num_classes=output_dim)
+    elif model_name == "vit":
+        model = ViT(image_size=32, num_classes = output_dim)
+    elif model_name == "mnasnet":
+        model = MNASNet(num_classes = output_dim)
+    elif model_name == "gpt2":
+        GPT2Config["hidden_size"] = args.nlp_hidden_size
+        model = GPT2Model(GPT2Config)
+        logging.info("number of parameters: %.2fM" % (model.get_num_params()/1e6,))
+    else:
+        raise Exception(f"{model_name} is not found !")
+    return model
+
+if __name__ == "__main__":
+    # quick fix for issue in MacOS environment: https://github.com/openai/spinningup/issues/16
+    if sys.platform == "darwin":
+        os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+
+    # initialize distributed computing (MPI)
+    comm, process_id, worker_number = FedML_init()
+
+    # parse python script input parameters
+    parser = argparse.ArgumentParser()
+    args = add_args(parser)
+    logging.info(args)
+
+    # customize the process name
+    str_process_name = "FedFLaST (distributed):" + str(process_id)
+    setproctitle.setproctitle(str_process_name)
+
+    # customize the log format
+    # logging.basicConfig(level=logging.INFO,
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format=str(process_id) + " - %(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s",
+        datefmt="%a, %d %b %Y %H:%M:%S",
+    )
+    hostname = socket.gethostname()
+    logging.info(
+        "#############process ID = "
+        + str(process_id)
+        + ", host name = "
+        + hostname
+        + "########"
+        + ", process ID = "
+        + str(os.getpid())
+        + ", process Name = "
+        + str(psutil.Process(os.getpid()))
+    )
+
+    # initialize the wandb machine learning experimental tracking platform (https://www.wandb.com/).
+    if process_id == 0:
+        density_tag = f"den{int(round(args.target_density * 100)):03d}"
+        alpha_tag = f"a{int(round(args.partition_alpha * 100)):03d}"
+        seed_tag = f"s{args.seed}"
+        schedule_tag = f"adj{int(round(args.adjust_alpha * 100)):03d}_dt{args.delta_T}_te{args.T_end}"
+        if getattr(args, 'use_fedflast_perturbation', False):
+            run_name = (f"{density_tag}_{alpha_tag}_{seed_tag}_{schedule_tag}_FedFLaST_{args.dataset}_{args.model}"
+                        f"_rho{args.flast_rho}_mu{args.flast_momentum}"
+                        f"_slr{args.flast_server_lr}")
+        else:
+            run_name = f"{density_tag}_{alpha_tag}_{seed_tag}_{schedule_tag}_noFLaST_{args.dataset}_{args.model}"
+        if getattr(args, 'use_flast_topology', False):
+            run_name += f"_topo{args.flast_topology_score}_lam{args.flast_topology_lambda}"
+        if getattr(args, 'use_flast_client_sam_prune', False):
+            run_name += (
+                f"_clientSAMprune_rho{args.flast_local_rho}"
+                f"_cand{args.flast_candidate_multiplier}"
+                f"_{args.flast_local_sam_norm}"
+            )
+        wandb.init(
+            project="FedPruning",
+            name=run_name,
+            config=args,
+        )
+
+    # Set the random seed. The np.random seed determines the dataset partition.
+    # The torch_manual_seed determines the initial weight.
+    # We fix these two, so that we can reproduce the result.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    # Please check "GPU_MAPPING.md" to see how to define the topology
+    logging.info("process_id = %d, size = %d" % (process_id, worker_number))
+    device = mapping_processes_to_gpu_device_from_yaml_file(
+        process_id, worker_number, args.gpu_mapping_file, args.gpu_mapping_key
+    )
+
+    # load data
+    dataset = load_data(args, args.dataset)
+
+    [
+        train_data_num,
+        test_data_num,
+        train_data_global, # None here 
+        test_data_global,
+        train_data_local_num_dict,
+        train_data_local_dict, 
+        test_data_local_dict, 
+        class_num,
+    ] = dataset
+
+    # create model.
+    # Note if the model is DNN (e.g., ResNet), the training will be very slow.
+    # In this case, please use our FedML distributed version (./experiments/distributed_fedprune)
+    inner_model = create_model(args, model_name=args.model, output_dim=dataset[7])
+    # create the sparse model
+    model = SparseModel(inner_model, target_density=args.target_density, strategy=args.pruning_strategy)
+
+    # start distributed training
+    FedML_FedFLaST_distributed(
+        process_id,
+        worker_number,
+        device,
+        comm,
+        model,
+        train_data_num, 
+        None, # We do net need train_data_global, so we set it as None
+        test_data_global,
+        train_data_local_num_dict,
+        train_data_local_dict, 
+        None, # We do net need test_data_local_dict, so we set it as None
+        args,
+    )

@@ -1,0 +1,38 @@
+# Data and generated outputs
+data/
+wandb/
+logs/
+checkpoints/
+results/
+outputs/
+
+# Model/data artifacts
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.pkl
+*.h5
+
+# Runtime files
+mpi_host_file
+*.log
+*.out
+*.err
+
+# Python/editor cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+
+# Archives and platform files
+*.zip
+*.tar
+*.tar.gz
+.DS_Store
+
+# The release includes one intentional pretrained checkpoint.
+!weights/*.pt
